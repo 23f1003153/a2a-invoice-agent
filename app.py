@@ -26,7 +26,7 @@ AIPIPE_TOKEN = os.environ.get("AIPIPE_TOKEN", "")
 AIPIPE_URL = os.environ.get("AIPIPE_URL", "https://aipipe.org/openrouter/v1/chat/completions")
 MODEL = os.environ.get("MODEL", "openai/gpt-4.1-mini")
 ALLOWED = {t for t in os.environ.get("ALLOWED_TOKENS", "").split(",") if t}  # empty = any bearer token
-KEEP_BRACKETS = False  # evidence refs are returned exactly as written in the documents
+KEEP_BRACKETS = os.environ.get("KEEP_BRACKETS", "0") == "1"   # set KEEP_BRACKETS=1 on Render to return [R_...]
 
 A2A = "application/a2a+json"
 IN_MODE = "application/vnd.ga5.invoice-claim-batch+json"
@@ -182,7 +182,7 @@ def with_hint(p):
 
 
 def fmt(refs):
-    return [r if KEEP_BRACKETS else r.strip("[]") for r in refs]
+    return [("[" + r.strip("[] ") + "]") if KEEP_BRACKETS else r.strip("[] ") for r in refs]
 
 
 RULES = {
@@ -232,7 +232,7 @@ def normalize(pkg, d):
             ra = rule_action(triples[0][0])
             if ra and ra != action:
                 print("NOTE keyword-rule differs from model", pkg.get("packageId"), "model:", action, "rule:", ra)
-        return {"action": action, "facts": facts, "evidenceRefs": fmt(refs[:3]),
+        return {"action": action, "facts": facts, "evidenceRefs": list(refs[:3]),
                 "reason": str(d.get("reason", ""))[:700]}
     except Exception:
         return None
@@ -246,7 +246,7 @@ def fallback(pkg):
         ra = "settle_invoice"
     return {"action": ra or "open_exception",
             "facts": facts or {"vendorName": "unknown", "invoiceNumber": "unknown", "amountMinor": 0, "currency": "INR"},
-            "evidenceRefs": fmt(refs), "reason": "The model could not produce a validated decision, so the invoice goes to manual review."}
+            "evidenceRefs": list(refs), "reason": "The model could not produce a validated decision, so the invoice goes to manual review."}
 
 
 async def llm_batch(pkgs, rev):
@@ -298,6 +298,11 @@ async def decide(pkgs, rev):
             if not used_fallback:      # never cache fallbacks
                 db.execute("insert or replace into cache values(?,?)", (k, json.dumps(dec)))
             result[p["packageId"]] = dec
+    if len(pkgs) <= 8:
+        for p in pkgs:
+            t = analyze(p)[0]
+            print("AUDIT-DEBUG", p["packageId"], result[p["packageId"]]["action"], "|",
+                  (t[0][0][:450] if len(t) == 1 else "no-single-paragraph"))
     from collections import Counter
     print('ACTION MIX', dict(Counter(v['action'] for v in result.values())))
     return result
@@ -330,6 +335,21 @@ async def card():
                     "description": "Chooses settle, approve, hold, reject-duplicate or exception for each invoice package.",
                     "tags": ["invoice", "accounts-payable", "approval"]}],
     })
+
+
+@app.get("/debug/llm")
+async def debug_llm():
+    info = {"model": MODEL, "token_set": bool(AIPIPE_TOKEN), "token_length": len(AIPIPE_TOKEN), "keep_brackets": KEEP_BRACKETS}
+    try:
+        async with httpx.AsyncClient(timeout=30) as c:
+            r = await c.post(AIPIPE_URL, headers={"Authorization": f"Bearer {AIPIPE_TOKEN}"},
+                             json={"model": MODEL, "max_tokens": 5,
+                                   "messages": [{"role": "user", "content": "Reply with the single word OK."}]})
+        info["status"] = r.status_code
+        info["reply"] = r.text[:200]
+    except Exception as e:
+        info["error"] = str(e)[:200]
+    return JSONResponse(info)
 
 
 @router.post("/message:send")
@@ -380,8 +400,8 @@ async def handle_batch(principal, msg, mid, h):
         proposals.append({
             "packageId": p["packageId"],
             "actionId": "act_" + sha(f"{principal}|{data['batchId']}|{p['packageId']}|{d['action']}")[:24],
-            "action": d["action"], "facts": d["facts"], "evidenceRefs": d["evidenceRefs"],
-            "rationale": build_rationale(d)})
+            "action": d["action"], "facts": d["facts"], "evidenceRefs": fmt(d["evidenceRefs"]),
+            "rationale": build_rationale(dict(d, evidenceRefs=fmt(d["evidenceRefs"])))})
     tid, ctx = str(uuid.uuid4()), msg.get("contextId") or str(uuid.uuid4())
     hist = dict(msg, taskId=tid, contextId=ctx)
     task = {"id": tid, "contextId": ctx,
