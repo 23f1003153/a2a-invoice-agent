@@ -242,7 +242,7 @@ def fallback(pkg):
     triples, facts = analyze(pkg)
     refs = triples[0][1] if triples else REF.findall(pkg_text(pkg))[:3]
     ra = rule_action(triples[0][0]) if len(triples) == 1 else None
-    if ra is None and len(triples) == 1 and re.search(r"no (prior|earlier)|without an exception|no exception", triples[0][0].lower()):
+    if ra is None and len(triples) == 1 and re.search(r"no (prior|earlier)|without an exception|no exception|can be settled|release this payment|authorize its payment|different signed commercial invoice|independently issued invoice|separate commercial obligation", triples[0][0].lower()):
         ra = "settle_invoice"
     return {"action": ra or "open_exception",
             "facts": facts or {"vendorName": "unknown", "invoiceNumber": "unknown", "amountMinor": 0, "currency": "INR"},
@@ -253,9 +253,18 @@ async def llm_batch(pkgs, rev):
     br = " (including the square brackets)" if KEEP_BRACKETS else " (without the square brackets)"
     prompt = PROMPT.format(br=br, rev=rev, pk=json.dumps([with_hint(p) for p in pkgs], ensure_ascii=False))
     async with httpx.AsyncClient(timeout=38) as c:
-        r = await c.post(AIPIPE_URL, headers={"Authorization": f"Bearer {AIPIPE_TOKEN}"},
-                         json={"model": MODEL, "temperature": 0, "response_format": {"type": "json_object"},
-                               "messages": [{"role": "user", "content": prompt}]})
+        r = None
+        for use_json_mode in (True, False):
+            body = {"model": MODEL, "temperature": 0, "messages": [{"role": "user", "content": prompt}]}
+            if use_json_mode:
+                body["response_format"] = {"type": "json_object"}
+            r = await c.post(AIPIPE_URL, headers={"Authorization": f"Bearer {AIPIPE_TOKEN}"}, json=body)
+            if r.status_code == 200:
+                break
+            print("LLM HTTP", r.status_code, "model:", MODEL, "token set:", bool(AIPIPE_TOKEN),
+                  "body:", r.text[:300])
+            if r.status_code in (401, 403):
+                break
         r.raise_for_status()
     txt = r.json()["choices"][0]["message"]["content"]
     txt = re.sub(r"^```(?:json)?|```$", "", txt.strip()).strip()
