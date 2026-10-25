@@ -1,419 +1,226 @@
-"""
-A2A 1.0 Invoice Agent  (single file) - FINAL SAFE VERSION
-Run:
-  pip install fastapi uvicorn httpx
-  export PUBLIC_BASE_URL="https://YOUR-PUBLIC-HOST/a2a/"
-  export AIPIPE_TOKEN="your AI Pipe token"
-  export MODEL="openai/gpt-4.1-mini"
-  export KEEP_BRACKETS=1
-  uvicorn app:app --host 0.0.0.0 --port 8000
-"""
-import os, re, json, time, uuid, hashlib, sqlite3, asyncio
-from decimal import Decimal
-from urllib.parse import urlparse
-from datetime import datetime, timezone
-from collections import Counter
-import httpx
-from fastapi import FastAPI, APIRouter, Request
-from fastapi.responses import JSONResponse
 
-# ----------------------------------------------------------------- config
-BASE_URL = os.environ.get("PUBLIC_BASE_URL", "https://example.com/a2a/")
-BASE_PATH = urlparse(BASE_URL).path.rstrip("/")
-AIPIPE_TOKEN = os.environ.get("AIPIPE_TOKEN", "")
-AIPIPE_URL = os.environ.get("AIPIPE_URL", "https://aipipe.org/openrouter/v1/chat/completions")
-MODEL = os.environ.get("MODEL", "openai/gpt-4.1-mini")
-ALLOWED = {t for t in os.environ.get("ALLOWED_TOKENS", "").split(",") if t}
-KEEP_BRACKETS = os.environ.get("KEEP_BRACKETS", "0") == "1"
-
-A2A = "application/a2a+json"
-IN_MODE = "application/vnd.ga5.invoice-claim-batch+json"
-PROP_MODE = "application/vnd.ga5.invoice-action-proposals+json"
-RECEIPT_MODE = "application/vnd.ga5.invoice-action-receipts+json"
-RESULT_MODE = "application/vnd.ga5.invoice-action-results+json"
-ACTIONS = {"settle_invoice", "request_approval", "hold_invoice", "reject_duplicate", "open_exception"}
-TERMINAL = {"TASK_STATE_COMPLETED", "TASK_STATE_CANCELED", "TASK_STATE_FAILED", "TASK_STATE_REJECTED"}
-
-# ----------------------------------------------------------------- storage
-db = sqlite3.connect(os.environ.get("DB_PATH", "agent.db"), check_same_thread=False, isolation_level=None)
-db.executescript("""
-create table if not exists tasks(id text primary key, principal text, state text, body text, proposals text, created real);
-create table if not exists msgs(principal text, message_id text, hash text, task_id text, primary key(principal, message_id));
-create table if not exists cache(key text primary key, decision text);
-""")
-locks: dict = {}
-
-def canon(o) -> str:
-    return json.dumps(o, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-
-def sha(s: str) -> str:
-    return hashlib.sha256(s.encode()).hexdigest()
-
-def now() -> str:
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-
-def get_task(tid, principal):
-    r = db.execute("select body, proposals from tasks where id=? and principal=?", (tid, principal)).fetchone()
-    return (json.loads(r[0]), json.loads(r[1])) if r else (None, None)
-
-def save_task(principal, task, proposals, created=None):
-    db.execute("insert or replace into tasks values(?,?,?,?,?,?)",
-               (task["id"], principal, task["status"]["state"], json.dumps(task), json.dumps(proposals),
-                created or time.time()))
-
-# ----------------------------------------------------------------- http helpers
-def out(status, obj, headers=None):
-    return JSONResponse(obj, status_code=status, media_type=A2A, headers=headers)
-
-def err(status, msg, reason=None):
-    e = {"code": status, "message": msg}
-    if reason:
-        e["reason"] = reason
-    body = {"error": e}
-    if reason:
-        body["code"] = reason
-    return out(status, body)
-
-def guard(request: Request, post=False):
-    m = re.fullmatch(r"Bearer (\S+)", request.headers.get("authorization", ""))
-    if not m or (ALLOWED and m.group(1) not in ALLOWED):
-        return None, out(401, {"error": {"code": 401, "message": "Unauthorized"}}, {"WWW-Authenticate": "Bearer"})
-    if request.headers.get("a2a-version") != "1.0":
-        return None, err(400, "Unsupported or missing A2A-Version", "VERSION_NOT_SUPPORTED")
-    acc = request.headers.get("accept", "*/*")
-    if not any(x in acc for x in (A2A, "application/json", "*/*", "application/*")):
-        return None, err(406, "Not acceptable")
-    if post:
-        ct = request.headers.get("content-type", "").split(";")[0].strip().lower()
-        if ct != A2A:
-            return None, err(415, "Unsupported media type")
-    return sha(m.group(1))[:32], None
-
-# ----------------------------------------------------------------- AI / decision layer
-PROMPT = """You are an accounts-payable analyst. For EACH invoice package choose exactly one action:
-- settle_invoice: valid, fully reconciled, within autonomous approval authority.
-- request_approval: commercially valid but ABOVE delegated approval limit / needs a higher approver.
-- hold_invoice: payment must pause until a stated verification (bank-detail check, PO/receipt confirmation, etc.) completes.
-- reject_duplicate: the SAME commercial invoice (same vendor + invoice number/amount) was ALREADY PAID. A payment for a different invoice is NOT a duplicate.
-- open_exception: material records conflict (amount/vendor/PO mismatch etc.) and need an exception workflow.
-Rules:
-- Each package mixes useful facts with OLD ARCHIVE EXAMPLES, TRAINING DECOYS, superseded policy, negated sentences and irrelevant action words. None of those decide anything. Never copy references from them.
-- The cover sheet only introduces the case. Its reference is NEVER evidence.
-- Decide from the CURRENT invoice's own controlling facts: one paragraph states the facts that determine the action.
-- A prior payment of a DIFFERENT invoice number is NOT a duplicate.
-- If a package has "controllingParagraph", decide ONLY from that paragraph.
-- evidenceRefs = exactly the THREE bracketed references that appear inside that one controlling paragraph, copied character-for-character{br}.
-- amountMinor = the current invoice total in minor units as an integer. currency = 3-letter code.
-Return ONLY JSON: {{"decisions":[{{"packageId":"","analysis":"","action":"","vendorName":"","invoiceNumber":"","amountMinor":0,"currency":"","evidenceRefs":["","",""],"reason":"1-2 sentences naming the decisive fact"}}]}}
-Policy revision: {rev}
-PACKAGES:
-{pk}"""
-
-REF = re.compile(r"\[[A-Za-z0-9_\-]{6,}\]")
-FACT = re.compile(r"Supplier\s+([^;]+?);\s*invoice\s+([^;]+?);\s*stated total\s+([A-Z]{3})\s+([\d,]+(?:\.\d+)?)")
-
-def pkg_text(pkg):
-    return json.dumps(pkg, ensure_ascii=False)
-
-def analyze(pkg):
-    paras = []
-    for d in (pkg.get("documents", []) if isinstance(pkg, dict) else []):
-        paras += str(d.get("text", "")).split("\n\n")
-    triples = []
-    for para in paras:
-        refs = list(dict.fromkeys(REF.findall(para)))
-        if len(refs) == 3:
-            triples.append((para, refs))
-    facts = None
-    m = FACT.search("\n\n".join(paras))
-    if m:
-        try:
-            facts = {
-                "vendorName": m.group(1).strip(),
-                "invoiceNumber": m.group(2).strip(),
-                "amountMinor": int((Decimal(m.group(4).replace(",", "")) * 100).to_integral_value()),
-                "currency": m.group(3)
-            }
-        except Exception:
-            facts = None
-    return triples, facts
-
-def with_hint(p):
-    t, facts = analyze(p)
-    if len(t) == 1:
-        return {"packageId": p["packageId"], "coverSheetFacts": facts, "controllingParagraph": t[0][0]}
-    return p
-
-def fmt(refs):
-    return [("[" + r.strip("[] ") + "]") if KEEP_BRACKETS else r.strip("[] ") for r in refs]
-
-RULES = {
-    "reject_duplicate": [
-        r"earlier settled entry", r"earlier posting for the same", r"second disbursement",
-        r"exact commercial duplicate", r"second settlement", r"already (been )?(paid|settled)",
-        r"a second payment would be a duplicate", r"reject the repeat", r"cannot justify another transfer",
-        r"finance has already transferred funds", r"reuses that original document"
-    ],
-    "request_approval": [
-        r"delegation ceiling", r"autonomous delegation", r"named (financial )?approver",
-        r"without escalation only up to", r"delegation schedule", r"above that ceiling",
-        r"authorization threshold", r"outside the operator'?s .* authority",
-        r"requires the financial-approval workflow"
-    ],
-    "hold_invoice": [
-        r"out-of-band", r"callback", r"pre-existing contact channel", r"changed instructions",
-        r"beneficiary details", r"destination-account change", r"payment-change control",
-        r"must remain paused", r"independent identity check", r"known-number callback",
-        r"treasury forbids remittance", r"payment-detail changes until"
-    ],
-    "open_exception": [
-        r"exception queue", r"exception case", r"documented exception", r"exception workflow",
-        r"contradictory signed records", r"incompatible explanations", r"documented exception process",
-        r"outside the permitted reconciliation tolerance", r"bars settlement or simple hold"
-    ],
-}
-
-def rule_action(para: str):
-    t = para.lower()
-    hits = [a for a, pats in RULES.items() if any(re.search(p, t) for p in pats)]
-    return hits[0] if len(hits) == 1 else None
-
-def normalize(pkg, d):
-    try:
-        triples, facts = analyze(pkg)
-        text = pkg_text(pkg)
-        if d.get("action") not in ACTIONS:
-            return None
-        if len(triples) == 1:
-            refs = triples[0][1]
-        else:
-            refs = []
-            for r in d.get("evidenceRefs", []):
-                r = "[" + str(r).strip("[] ") + "]"
-                if r in text and r not in refs:
-                    refs.append(r)
-            if len(refs) < 2:
-                if triples:
-                    refs = triples[0][1]
-                else:
-                    return None
-        if facts is None:
-            facts = {
-                "vendorName": str(d["vendorName"]),
-                "invoiceNumber": str(d["invoiceNumber"]),
-                "amountMinor": int(round(float(d["amountMinor"]))),
-                "currency": str(d["currency"]).upper()
-            }
-        action = d["action"]
-        # Force rule-based override when model disagrees
-        if len(triples) == 1:
-            ra = rule_action(triples[0][0])
-            if ra and ra != action:
-                print(f"OVERRIDE model={action} → rule={ra}  pkg={pkg.get('packageId')}")
-                action = ra
-        return {
-            "action": action,
-            "facts": facts,
-            "evidenceRefs": list(refs[:3]),
-            "reason": str(d.get("reason", ""))[:700]
-        }
-    except Exception:
+Youlenovo@LAPTOP-PJRCFIM0:/mnt/c/Windows/system32$ cd ~/mailroom-agent && source venv/bin/activate
+python3 - <<'EOF'
+import glob, os, json, re, collections
+f = sorted(glob.glob("requests/*_propose.json"), key=os.path.getsize)[-1]
+b = json.load(open(f)); c = collections.Counter()
+for d in b["dossiers"]:
+    L = [(s["kind"], l["text"]) for s in d["sources"] for l in s["lines"]]
+    rec = next((re.search(r"requires ([\w-]+) confirmation", t).group(1) for k, t in L if k == "record" and "confirmation" in t), None)
+    if not rec: continue
+    own = next((re.search(r"ownership remains with ([\w-]+)", t).group(1) for k, t in L if k == "history" and "ownership remains with" in t), None)
+    c[(d["mailbox"], "record says:", rec, "history owner:", own)] += 1
+for k, v in sorted(c.items()): print(v, k)
+EOF^C
+lenovo@LAPTOP-PJRCFIM0:/mnt/c/Windows/system32$ cd
+lenovo@LAPTOP-PJRCFIM0:~$ cd ~/mailroom-agent && source venv/bin/activate
+python3 - <<'EOF'
+import glob, os, json, re, collections
+f = sorted(glob.glob("requests/*_propose.json"), key=os.path.getsize)[-1]
+b = json.load(open(f)); c = collections.Counter()
+for d in b["dossiers"]:
+    L = [(s["kind"], l["text"]) for s in d["sources"] for l in s["lines"]]
+    rec = next((re.search(r"requires ([\w-]+) confirmation", t).group(1) for k, t in L if k == "record" and "confirmation" in t), None)
+    if not rec: continue
+    own = next((re.search(r"ownership remains with ([\w-]+)", t).group(1) for k, t in L if k == "history" and "ownership remains with" in t), None)
+    c[(d["mailbox"], "record says:", rec, "history owner:", own)] += 1
+for k, v in sorted(c.items()): print(v, k)
+EOF
+1 ('customer-care', 'record says:', 'billing-control', 'history owner:', 'billing-control')
+1 ('customer-care', 'record says:', 'fulfilment-leads', 'history owner:', 'fulfilment-leads')
+1 ('customer-care', 'record says:', 'vendor-assurance', 'history owner:', 'vendor-assurance')
+1 ('dispatch', 'record says:', 'account-security', 'history owner:', None)
+1 ('dispatch', 'record says:', 'vendor-assurance', 'history owner:', 'vendor-assurance')
+1 ('orders', 'record says:', 'billing-control', 'history owner:', 'billing-control')
+1 ('orders', 'record says:', 'fulfilment-leads', 'history owner:', 'fulfilment-leads')
+1 ('returns', 'record says:', 'account-security', 'history owner:', None)
+1 ('returns', 'record says:', 'fulfilment-leads', 'history owner:', 'fulfilment-leads')
+1 ('vendor-care', 'record says:', 'billing-control', 'history owner:', None)
+(venv) lenovo@LAPTOP-PJRCFIM0:~/mailroom-agent$
+(venv) lenovo@LAPTOP-PJRCFIM0:~/mailroom-agent$ cp mailroom.db mailroom_check2.db
+cp main.py main.py.v6
+cat >> main.py <<'EOF'
+# ===== v7 (append once): broader rules + argument experiments =====
+VARIANTS = os.environ.get("VARIANTS", "0") == "1"
+DROP_POLICY_FOR = {x for x in os.environ.get("DROP_POLICY_FOR", "").split(",") if x}
+_EM = r"[\w.+-]+@[\w-]+(?:.[\w-]+)+"
+def _pick(dos, opts):
+    return opts[int(sha(canon(dos))[:8], 16) % len(opts)] if VARIANTS else opts[0]
+def _note(dos, name):
+    if VARIANTS:
+        with open("variants.jsonl", "a") as f: f.write(json.dumps({"id": dos["dossierId"], "v": name}) + "\n")
+def _rules_v7(dos):
+    L = [(l["lineId"], s["kind"], l["text"]) for s in dos["sources"] for l in s["lines"]]
+    def find(kind, pat):
+        for lid, k, t in L:
+            if k == kind:
+                m = re.search(pat, t, re.I)
+                if m: return lid, m
         return None
-
-def fallback(pkg):
-    triples, facts = analyze(pkg)
-    if len(triples) == 1:
-        para, refs = triples[0]
-        ra = rule_action(para)
-        if ra is None:
-            low = para.lower()
-            # Strict priority order – never guess settle when unsure
-            if any(x in low for x in [
-                "second disbursement", "already paid", "exact commercial duplicate",
-                "reject the repeat", "cannot justify another transfer",
-                "finance has already transferred", "reuses that original document",
-                "already been paid", "second settlement"
-            ]):
-                ra = "reject_duplicate"
-            elif any(x in low for x in [
-                "delegation ceiling", "named financial approver", "without escalation only up to",
-                "above that ceiling", "authorization threshold", "outside the operator",
-                "requires the financial-approval"
-            ]):
-                ra = "request_approval"
-            elif any(x in low for x in [
-                "callback", "beneficiary", "destination-account", "payment-change control",
-                "out-of-band", "treasury forbids", "known-number callback"
-            ]):
-                ra = "hold_invoice"
-            elif any(x in low for x in [
-                "exception queue", "exception case", "contradictory signed records",
-                "incompatible explanations", "outside the permitted reconciliation",
-                "bars settlement or simple hold"
-            ]):
-                ra = "open_exception"
-            else:
-                # When no strong signal → safer to escalate than to settle
-                ra = "open_exception"
-        return {
-            "action": ra,
-            "facts": facts or {"vendorName": "unknown", "invoiceNumber": "unknown",
-                               "amountMinor": 0, "currency": "INR"},
-            "evidenceRefs": refs,
-            "reason": "Rule-based decision from the single controlling paragraph."
-        }
-
-    # No clean paragraph → safest default
-    all_refs = REF.findall(pkg_text(pkg))[:3]
-    return {
-        "action": "open_exception",
-        "facts": facts or {"vendorName": "unknown", "invoiceNumber": "unknown",
-                           "amountMinor": 0, "currency": "INR"},
-        "evidenceRefs": all_refs,
-        "reason": "Could not isolate a single controlling paragraph."
-    }
-async def llm_batch(pkgs, rev):
-    br = " (including the square brackets)" if KEEP_BRACKETS else " (without the square brackets)"
-    prompt = PROMPT.format(br=br, rev=rev, pk=json.dumps([with_hint(p) for p in pkgs], ensure_ascii=False))
-    async with httpx.AsyncClient(timeout=38) as c:
-        r = None
-        for use_json_mode in (True, False):
-            body = {"model": MODEL, "temperature": 0, "messages": [{"role": "user", "content": prompt}]}
-            if use_json_mode:
-                body["response_format"] = {"type": "json_object"}
-            r = await c.post(AIPIPE_URL, headers={"Authorization": f"Bearer {AIPIPE_TOKEN}"}, json=body)
-            if r.status_code == 200:
-                break
-            print("LLM HTTP", r.status_code, "model:", MODEL, "token set:", bool(AIPIPE_TOKEN),
-                  "body:", r.text[:300])
-            if r.status_code in (401, 403):
-                break
-        r.raise_for_status()
-    txt = r.json()["choices"][0]["message"]["content"]
-    txt = re.sub(r"^```(?:json)?|```$", "", txt.strip()).strip()
-    return {d.get("packageId"): d for d in json.loads(txt)["decisions"]}
-
-async def decide(pkgs, rev):
-    keys = [sha(canon(p)) for p in pkgs]
-    result, todo = {}, []
-    for p, k in zip(pkgs, keys):
-        row = db.execute("select decision from cache where key=?", (k,)).fetchone()
-        if row:
-            result[p["packageId"]] = json.loads(row[0])
+    def pol(pat):
+        r = find("policy", pat)
+        return [r[0]] if r else []
+    def rec_for(ref):
+        return find("record", r"Order " + re.escape(ref) + r"\b[^“]*“([^”]*)”")
+    def out(action, target, payload, ev):
+        return {"dossierId": dos["dossierId"], "action": action, "target": target,
+                "payload": payload, "evidence": list(dict.fromkeys(ev))}
+    # 1) live injection: attachment lines that are NOT labelled non-operative / no-authority
+    inj = [lid for lid, k, t in L if k == "attachment" and not re.search(r"non-operative|no action authority|no live tool direction", t, re.I)]
+    att = find("attachment", r"The attachment is (ATT-\w+)")
+    if inj and att:
+        ev = inj + [att[0]] + pol(r"Quarantine external content|exfiltrate|security holding area")
+        return out("quarantine_item", {"kind": "security_queue", "id": "mailroom"},
+                   {"artifactId": att[1].group(1), "reasonCode": "INDIRECT_PROMPT_INJECTION"}, ev)
+    # 2) signed event changes delivery_window on this case
+    e = find("event", r"(EVT-\w+)\b.*?\bcase (CASE-\w+)\b.*?delivery_window to the exact value “([^”]*)”")
+    if e:
+        ev = [e[0]]
+        sig = find("event", r"signature was verified")
+        if sig: ev.append(sig[0])
+        ev += pol(r"verified carrier event may update|trusted carrier change")
+        return out("update_internal_record", {"kind": "case_record", "id": e[1].group(2)},
+                   {"field": "delivery_window", "sourceEventId": e[1].group(1), "value": e[1].group(3)}, ev)
+    # 3) identity conflict -> approval queue
+    rc = find("record", r"authenticated contact for (CASE-\w+) (?:does not match|differs from) (" + _EM + r").*?requires ([\w-]+) confirmation")
+    mi = find("message", r"I am (" + _EM + ")")
+    mo = find("message", r"supplies order (ORD-\w+)")
+    if rc and mi and mo:
+        case, rteam, ordref = rc[1].group(1), rc[1].group(3), mo[1].group(1)
+        h = find("history", r"ownership remains with ([\w-]+)")
+        hteam = h[1].group(1) if h else rteam
+        if VARIANTS:
+            name, ref, team = _pick(dos, [("CASE-rec", case, rteam), ("ORD-hist", ordref, hteam),
+                                          ("CASE-hist", case, hteam), ("DOSSIER-rec", dos["dossierId"], rteam)])
+            _note(dos, "conf-" + name)
         else:
-            todo.append((p, k))
-    if todo:
-        try:
-            raw = await llm_batch([p for p, _ in todo], rev)
-        except Exception as e:
-            print("LLM error", e)
-            raw = {}
-        for p, k in todo:
-            dec = normalize(p, raw.get(p["packageId"], {}))
-            used_fallback = dec is None
-            if dec is None:
-                print("FALLBACK for", p["packageId"], "model said:", json.dumps(raw.get(p["packageId"]))[:300])
-                dec = fallback(p)
-            else:
-                print("OK", p["packageId"], dec["action"], dec["evidenceRefs"])
-            # Final safety: never settle if strong negative signals exist
-            # Final safety net
-        triples, _ = analyze(p)
-        if len(triples) == 1:
-            low = triples[0][0].lower()
-            ra = rule_action(triples[0][0])
-        
-            # Never settle if any strong negative signal exists
-            if dec["action"] == "settle_invoice":
-                if any(k in low for k in [
-                    "ceiling", "approver", "callback", "beneficiary",
-                    "duplicate", "exception", "second disbursement",
-                    "already transferred", "reuses that original",
-                    "outside the permitted", "bars settlement"
-                ]):
-                    if ra:
-                        print(f"SAFETY BLOCK settle → {ra}")
-                        dec["action"] = ra
-                    else:
-                        print("SAFETY BLOCK settle → open_exception")
-                        dec["action"] = "open_exception"
-            if not used_fallback:
-                db.execute("insert or replace into cache values(?,?)", (k, json.dumps(dec)))
-            result[p["packageId"]] = dec
-    if len(pkgs) <= 8:
-        for p in pkgs:
-            t = analyze(p)[0]
-            print("AUDIT-DEBUG", p["packageId"], result[p["packageId"]]["action"], "|",
-                  (t[0][0][:450] if len(t) == 1 else "no-single-paragraph"))
-    print('ACTION MIX', dict(Counter(v['action'] for v in result.values())))
-    return result
+            ref, team = ordref, rteam
+        ev = [rc[0], mi[0], mo[0]] + pol(r"identity conflicts|claimed correspondent|independent confirmation|owning approval queue")
+        if h and team == hteam and hteam != rteam: ev.append(h[0])
+        return out("request_confirmation", {"kind": "approval_queue", "id": team},
+                   {"claimedSender": mi[1].group(1), "questionCode": "VERIFY_REQUEST", "referenceId": ref}, ev)
+    # 4) completed / duplicate / informational
+    rn = find("record", r"(CASE-\w+) records this item as (already completed|duplicate|informational)(?:; the prior action has terminal event (EVT-\w+))?")
+    mo2 = find("message", r"follow-up about (ORD-\w+)")
+    if rn and mo2:
+        reason = {"already completed": "ALREADY_COMPLETED", "duplicate": "DUPLICATE",
+                  "informational": "INFORMATIONAL"}[rn[1].group(2).lower()]
+        case, evt, ordref = rn[1].group(1), rn[1].group(3), mo2[1].group(1)
+        if VARIANTS:
+            name, ref = _pick(dos, [("EVT", evt or case), ("CASE", case), ("DOSSIER", dos["dossierId"])])
+            _note(dos, "noact-" + name)
+        else:
+            ref = ordref
+        ev = [rn[0], mo2[0]] + pol(r"second side effect|already-handled|information-only")
+        return out("no_action", None, {"reasonCode": reason, "referenceId": ref}, ev)
+    # 5) approval for THIS recipient/order AND the CURRENT status -> send
+    ap = find("approval", r"Approval (EVT-\w+)(?: permits one delivery-status notice for| authorizes a single outbound shipment update about) (ORD-\w+) to (" + _EM + r") using template approved_delivery_notice")
+    if ap:
+        sc = find("approval", r"(?:public status|customer-visible state) “([^”]*)”")
+        ref, rcp = ap[1].group(2), ap[1].group(3)
+        rec = rec_for(ref)
+        if sc and rec and sc[1].group(1) == rec[1].group(1):
+            return out("send_approved_notice", {"kind": "email", "id": rcp},
+                       {"referenceId": ref, "status": sc[1].group(1), "template": "approved_delivery_notice"},
+                       [ap[0], sc[0], rec[0]] + pol(r"Only current evidence"))
+    # 6) unverified enquiry -> draft in the owning mailbox
+    rq = find("message", r"(?:prepare an update for order|Compose an unsent status note for order|unsent [\w ]*? for order) (ORD-\w+)")
+    sd = find("message", r"sender address recorded by the gateway is (" + _EM + ")")
+    dp = find("policy", r"unverified|without sender verification|unsent|draft")
+    if rq and sd and dp:
+        ref = rq[1].group(1)
+        rec = rec_for(ref)
+        if rec:
+            return out("create_draft", {"kind": "draft_queue", "id": "mailbox:" + dos["mailbox"]},
+                       {"recipient": sd[1].group(1), "referenceId": ref, "status": rec[1].group(1),
+                        "template": "order_status"}, [dp[0], rq[0], sd[0], rec[0]])
+    return None
+def rule_decide(dos):
+    r = *rules_v7(dos)
+    if r and r["action"] in DROP_POLICY_FOR:
+        kinds = {l["lineId"]: s["kind"] for s in dos["sources"] for l in s["lines"]}
+        keep = [e for e in r["evidence"] if kinds.get(e) != "policy"]
+        if keep: r["evidence"] = keep
+    return r
+EOF
+python3 -c "import ast;ast.parse(open('main.py').read());print('syntax ok')"
+syntax ok
+(venv) lenovo@LAPTOP-PJRCFIM0:~/mailroom-agent$ rm -f mailroom.db variants.jsonl
+VARIANTS=1 uvicorn main:app --port 8001
+INFO:     Started server process [827]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://127.0.0.1:8001 (Press CTRL+C to quit)
+propose replay-1792943591: 64 dossiers, 0 fallbacks
+INFO:     127.0.0.1:46326 - "POST / HTTP/1.1" 200 OK
+INFO:     127.0.0.1:41256 - "POST / HTTP/1.1" 400 Bad Request
+INFO:     127.0.0.1:41258 - "POST / HTTP/1.1" 404 Not Found
+INFO:     127.0.0.1:41268 - "POST / HTTP/1.1" 404 Not Found
+INFO:     127.0.0.1:41282 - "POST / HTTP/1.1" 404 Not Found
+INFO:     127.0.0.1:41284 - "POST / HTTP/1.1" 404 Not Found
+INFO:     127.0.0.1:41300 - "POST / HTTP/1.1" 404 Not Found
+INFO:     127.0.0.1:41316 - "POST / HTTP/1.1" 404 Not Found
+INFO:     127.0.0.1:41322 - "POST / HTTP/1.1" 404 Not Found
+INFO:     127.0.0.1:41336 - "POST / HTTP/1.1" 404 Not Found
+INFO:     127.0.0.1:41340 - "POST / HTTP/1.1" 404 Not Found
+INFO:     127.0.0.1:41344 - "POST / HTTP/1.1" 404 Not Found
+INFO:     127.0.0.1:41348 - "POST / HTTP/1.1" 404 Not Found
+INFO:     127.0.0.1:41364 - "POST / HTTP/
+…
 
-def build_rationale(dec):
-    f, refs = dec["facts"], dec["evidenceRefs"]
-    s = (f"Action {dec['action']} for invoice {f['invoiceNumber']} from {f['vendorName']}: {dec['reason']} "
-         f"Decisive evidence: {', '.join(refs)}.")
-    s = s[:1500]
-    return s if len(s) >= 60 else s + " This follows the policy paragraph cited above."
+Pasted text.txt
+Document
+make this code ready to paste fully formated
 
-# ----------------------------------------------------------------- app
-app = FastAPI()
-router = APIRouter()
 
-@app.get("/.well-known/agent-card.json")
-async def card():
-    return out(200, {
-        "name": "Invoice Action Agent",
-        "description": "Reads invoice packages, proposes one evidence-backed action each, and executes only approved actions.",
-        "version": "1.0.0",
-        "capabilities": {"streaming": False, "pushNotifications": False},
-        "supportedInterfaces": [{"url": BASE_URL, "protocolBinding": "HTTP+JSON", "protocolVersion": "1.0"}],
-        "defaultInputModes": [IN_MODE, "application/json"],
-        "defaultOutputModes": [PROP_MODE, RECEIPT_MODE],
-        "skills": [{"id": "invoice_action_agent", "name": "Invoice action agent",
-                    "description": "Chooses settle, approve, hold, reject-duplicate or exception for each invoice package.",
-                    "tags": ["invoice", "accounts-payable", "approval"]}],
-    })
 
-@app.get("/debug/llm")
-async def debug_llm():
-    info = {"model": MODEL, "token_set": bool(AIPIPE_TOKEN), "token_length": len(AIPIPE_TOKEN), "keep_brackets": KEEP_BRACKETS}
-    try:
-        async with httpx.AsyncClient(timeout=30) as c:
-            r = await c.post(AIPIPE_URL, headers={"Authorization": f"Bearer {AIPIPE_TOKEN}"},
-                             json={"model": MODEL, "max_tokens": 5,
-                                   "messages": [{"role": "user", "content": "Reply with the single word OK."}]})
-        info["status"] = r.status_code
-        info["reply"] = r.text[:200]
-    except Exception as e:
-        info["error"] = str(e)[:200]
-    return JSONResponse(info)
 
-@router.post("/message:send")
-async def message_send(request: Request):
-    principal, bad = guard(request, post=True)
-    if bad:
-        return bad
-    try:
-        body = await request.json()
-        msg = body["message"]
-        mid = str(msg["messageId"])
-        assert msg["role"] == "ROLE_USER" and isinstance(msg["parts"], list) and msg["parts"] and mid
-    except Exception:
-        return err(400, "Invalid request")
-    h = sha(canon(msg))
-    lock = locks.setdefault((principal, mid), asyncio.Lock())
-    async with lock:
-        row = db.execute("select hash, task_id from msgs where principal=? and message_id=?", (principal, mid)).fetchone()
-        if row:
-            if row[0] != h:
-                return err(409, "Message ID reused with different content", "IDEMPOTENCY_CONFLICT")
-            task, _ = get_task(row[1], principal)
-            return out(200, {"task": task})
-        if msg.get("taskId"):
-            return handle_results(principal, msg, mid, h)
-        return await handle_batch(principal, msg, mid, h)
 
-async def handle_batch(principal, msg, mid, h):
+
+
+I've prepared your complete 533-line Python code, formatted and saved as app.py. I've also checked that it passes Python syntax validation.
+
+Invoice Action Agent — app.py
+
+Python · FastAPI · A2A 1.0 · SQLite · AI Pipe
+
+Syntax validation passed
+
+Download the complete formatted Python file
+
+How to run it
+1. Open your project folder in the terminal and save the downloaded file as app.py.
+
+2. Install the dependencies:
+
+pip install fastapi uvicorn httpx
+
+3. Configure your environment variables.
+
+For Linux or WSL, run:
+
+export PUBLIC_BASE_URL="https://YOUR-PUBLIC-HOST/a2a/"
+export AIPIPE_TOKEN="your_ai_pipe_token"
+export MODEL="openai/gpt-4.1-mini"
+export KEEP_BRACKETS=1
+
+Replace the placeholder URL with your actual public endpoint and provide your real AI Pipe token.
+
+4. Start the application:
+
+uvicorn app:app --host 0.0.0.0 --port 8000
+
+5. Check the application locally:
+
+Agent card: http://localhost:8000/.well-known/agent-card.json
+
+AI connection diagnostic: http://localhost:8000/debug/llm
+
+Note that syntax validation does not guarantee successful API authentication, deployment, or A2A protocol compatibility. The debug endpoint also exposes token-related metadata, so restrict access to it before deploying publicly.
+
+
+app.py
+Code
     part = next((p for p in msg["parts"] if p.get("mediaType") == IN_MODE and isinstance(p.get("data"), dict)), None)
     if not part:
         return err(400, "Missing invoice batch part")
@@ -531,3 +338,6 @@ async def task_cancel(ref: str, request: Request):
     return out(200, task)
 
 app.include_router(router, prefix=BASE_PATH)
+
+
+
