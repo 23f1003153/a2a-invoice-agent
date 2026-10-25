@@ -227,29 +227,34 @@ def fallback(pkg):
         ra = rule_action(para)
         if ra is None:
             low = para.lower()
+            # Strict priority order – never guess settle when unsure
             if any(x in low for x in [
                 "second disbursement", "already paid", "exact commercial duplicate",
                 "reject the repeat", "cannot justify another transfer",
-                "finance has already transferred", "reuses that original document"
+                "finance has already transferred", "reuses that original document",
+                "already been paid", "second settlement"
             ]):
                 ra = "reject_duplicate"
             elif any(x in low for x in [
                 "delegation ceiling", "named financial approver", "without escalation only up to",
-                "above that ceiling", "authorization threshold", "outside the operator"
+                "above that ceiling", "authorization threshold", "outside the operator",
+                "requires the financial-approval"
             ]):
                 ra = "request_approval"
             elif any(x in low for x in [
                 "callback", "beneficiary", "destination-account", "payment-change control",
-                "out-of-band", "treasury forbids"
+                "out-of-band", "treasury forbids", "known-number callback"
             ]):
                 ra = "hold_invoice"
             elif any(x in low for x in [
                 "exception queue", "exception case", "contradictory signed records",
-                "incompatible explanations", "outside the permitted reconciliation"
+                "incompatible explanations", "outside the permitted reconciliation",
+                "bars settlement or simple hold"
             ]):
                 ra = "open_exception"
             else:
-                ra = "settle_invoice"
+                # When no strong signal → safer to escalate than to settle
+                ra = "open_exception"
         return {
             "action": ra,
             "facts": facts or {"vendorName": "unknown", "invoiceNumber": "unknown",
@@ -257,6 +262,8 @@ def fallback(pkg):
             "evidenceRefs": refs,
             "reason": "Rule-based decision from the single controlling paragraph."
         }
+
+    # No clean paragraph → safest default
     all_refs = REF.findall(pkg_text(pkg))[:3]
     return {
         "action": "open_exception",
@@ -265,7 +272,6 @@ def fallback(pkg):
         "evidenceRefs": all_refs,
         "reason": "Could not isolate a single controlling paragraph."
     }
-
 async def llm_batch(pkgs, rev):
     br = " (including the square brackets)" if KEEP_BRACKETS else " (without the square brackets)"
     prompt = PROMPT.format(br=br, rev=rev, pk=json.dumps([with_hint(p) for p in pkgs], ensure_ascii=False))
@@ -311,18 +317,26 @@ async def decide(pkgs, rev):
             else:
                 print("OK", p["packageId"], dec["action"], dec["evidenceRefs"])
             # Final safety: never settle if strong negative signals exist
-            triples, _ = analyze(p)
-            if dec["action"] == "settle_invoice" and len(triples) == 1:
-                low = triples[0][0].lower()
+            # Final safety net
+        triples, _ = analyze(p)
+        if len(triples) == 1:
+            low = triples[0][0].lower()
+            ra = rule_action(triples[0][0])
+        
+            # Never settle if any strong negative signal exists
+            if dec["action"] == "settle_invoice":
                 if any(k in low for k in [
                     "ceiling", "approver", "callback", "beneficiary",
                     "duplicate", "exception", "second disbursement",
-                    "already transferred", "reuses that original"
+                    "already transferred", "reuses that original",
+                    "outside the permitted", "bars settlement"
                 ]):
-                    ra = rule_action(triples[0][0])
                     if ra:
                         print(f"SAFETY BLOCK settle → {ra}")
                         dec["action"] = ra
+                    else:
+                        print("SAFETY BLOCK settle → open_exception")
+                        dec["action"] = "open_exception"
             if not used_fallback:
                 db.execute("insert or replace into cache values(?,?)", (k, json.dumps(dec)))
             result[p["packageId"]] = dec
