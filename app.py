@@ -8,6 +8,7 @@ Run:
   export PUBLIC_BASE_URL="https://YOUR-HOST/a2a/"
   uvicorn app:app --host 0.0.0.0 --port 8000
 """
+from decimal import Decimal
 import os, re, json, time, uuid, asyncio, hashlib, sqlite3, threading, datetime, traceback
 from urllib.parse import urlparse
 import httpx
@@ -31,7 +32,7 @@ RES_T = "application/vnd.ga5.invoice-action-results+json"
 REC_T = "application/vnd.ga5.invoice-action-receipts+json"
 ACTIONS = {"settle_invoice", "request_approval", "hold_invoice", "reject_duplicate", "open_exception"}
 TERMINAL = {"TASK_STATE_COMPLETED", "TASK_STATE_CANCELED"}
-CACHE_VERSION = "v4"  # bump whenever you change a prompt or rule
+CACHE_VERSION = "v5"  # bump whenever you change a prompt or rule
 
 app = FastAPI()
 app_Q2 = app  # alias so old command "uvicorn app:app_Q2" also works
@@ -96,44 +97,92 @@ def card():
 
 
 # ------------------------------------------------------------------ AI layer
-PROMPT = """You are an accounts-payable analyst. For EACH package choose exactly one action:
-settle_invoice, request_approval, hold_invoice, reject_duplicate, open_exception.
-
-Decision rules, apply in this order:
-1. The SAME invoice (same vendor AND same invoice number) was already paid -> reject_duplicate.
-   A payment for a DIFFERENT invoice number is NOT a duplicate.
-2. Vendor, amount, PO or receipt records materially conflict -> open_exception.
-3. A named verification (bank details, tax ID, goods receipt, etc.) must finish before payment -> hold_invoice.
-4. Amount exceeds the autonomous approval limit that applies to this case -> request_approval.
-5. ONLY if none of the above apply -> settle_invoice.
-
-How to read the documents:
-- Find the ONE paragraph that states the controlling facts of THIS case. Return its three bracketed references,
-  copied exactly, brackets included, all from that single paragraph.
-- Ignore the cover sheet, archive examples, training material and decoys.
-- Negated statements ("not a duplicate", "no hold required") mean that action does NOT apply.
-- When unsure between settle_invoice and anything else, do NOT choose settle_invoice.
-
-Also return vendorName, invoiceNumber, amountMinor (integer, smallest currency unit, e.g. 1234.50 -> 123450),
-currency, and "reason": one sentence on why the evidence supports the action.
-Reply ONLY JSON: {"decisions":[{"packageId":"","action":"","vendorName":"","invoiceNumber":"","amountMinor":0,
-"currency":"","evidenceRefs":["","",""],"reason":""}]}"""
-
+# Idea: Python finds the paragraphs that contain exactly three [bracketed] refs
+# (the controlling paragraph is always one of them). The AI only chooses WHICH one
+# is controlling and WHAT action it requires. Python copies the refs itself.
+REF = re.compile(r"\[[A-Za-z0-9_\-]{6,}\]")
+FACT = re.compile(r"Supplier\s+([^;]+?);\s*invoice\s+([^;]+?);\s*stated total\s+([A-Z]{3})\s+([\d,]+(?:\.\d+)?)")
+DECOY = re.compile(r"archive|training|decoy|example|superseded|obsolete|former|legacy|sample|old ", re.I)
 CHECKS = ["valid_and_reconciled", "within_authority", "no_pending_verification",
           "not_already_paid", "no_conflicting_records"]
 
-VERIFY = """A colleague proposed settle_invoice for the invoice package below. Be a skeptical reviewer.
-Read the paragraph that states the controlling facts of THIS case (ignore cover sheets, archive examples,
-training decoys, and negated statements). Answer each check with true or false:
-- valid_and_reconciled: invoice, PO and receipt records agree
-- within_authority: amount is within the autonomous approval limit that applies
-- no_pending_verification: nothing must be verified before payment
-- not_already_paid: this exact invoice (same vendor AND invoice number) has not already been paid
-- no_conflicting_records: no material conflict between records
+PROMPT = """You are an accounts-payable analyst. For EACH package choose exactly one action:
+- settle_invoice: valid, fully reconciled, within autonomous approval authority.
+- request_approval: commercially valid, but the amount is ABOVE the delegated limit, so a named/higher approver must approve.
+- hold_invoice: payment must pause until a stated verification (callback, changed bank details, receipt check...) completes.
+- reject_duplicate: the SAME commercial invoice (same vendor AND same invoice number) was ALREADY PAID.
+  A payment for a DIFFERENT invoice number is NOT a duplicate.
+- open_exception: material records conflict and need an exception workflow.
+
+Each package contains "candidateParagraphs". Every candidate has exactly three bracketed refs.
+EXACTLY ONE candidate is the CONTROLLING paragraph: it states the live facts of THIS invoice and what must happen.
+The others are old archive examples, training decoys, superseded policy, or negated statements. Ignore them.
+("looksLikeDecoy" is only a hint, not proof.)
+Read what the controlling paragraph actually REQUIRES. Action words inside negated or hypothetical sentences
+("no callback is needed", "this is not a duplicate") mean that action does NOT apply.
+If a package has "package" instead of candidates, read it all, find the single controlling paragraph and return
+its three bracketed refs (copied exactly, brackets included) in evidenceRefs.
+Use coverSheetFacts for vendorName/invoiceNumber/amountMinor/currency when present.
+amountMinor is an integer in minor units (1234.50 -> 123450).
+Never choose settle_invoice when unsure.
+Reply ONLY JSON: {"decisions":[{"packageId":"","controllingIndex":0,"action":"","vendorName":"",
+"invoiceNumber":"","amountMinor":0,"currency":"","evidenceRefs":[],"reason":"one sentence naming the decisive fact"}]}"""
+
+VERIFY = """You are a skeptical reviewer. A colleague proposed settle_invoice for each package below.
+Use the controlling paragraph only (the single candidate that states the live facts of THIS invoice; ignore archive
+examples, decoys, superseded policy and negated sentences). For each package answer true/false:
+valid_and_reconciled, within_authority, no_pending_verification, not_already_paid, no_conflicting_records.
 Then give the correct action (settle_invoice, request_approval, hold_invoice, reject_duplicate or open_exception)
-and the three exact bracketed references from the single controlling paragraph.
-Reply ONLY JSON: {"checks":{"valid_and_reconciled":true,"within_authority":true,"no_pending_verification":true,
-"not_already_paid":true,"no_conflicting_records":true},"action":"","evidenceRefs":["","",""],"reason":""}"""
+and controllingIndex.
+Reply ONLY JSON: {"verdicts":[{"packageId":"","controllingIndex":0,"checks":{"valid_and_reconciled":true,
+"within_authority":true,"no_pending_verification":true,"not_already_paid":true,"no_conflicting_records":true},
+"action":"","reason":""}]}"""
+
+
+def _strings(o, acc):
+    if isinstance(o, str):
+        acc.append(o)
+    elif isinstance(o, dict):
+        for v in o.values():
+            _strings(v, acc)
+    elif isinstance(o, list):
+        for v in o:
+            _strings(v, acc)
+
+
+def analyze(p):
+    acc = []
+    _strings(p, acc)
+    paras = []
+    for s in acc:
+        paras += [x.strip() for x in re.split(r"\n\s*\n", s) if x.strip()]
+    triples, seen = [], set()
+    for para in paras:
+        refs = list(dict.fromkeys(REF.findall(para)))
+        if len(refs) == 3 and para not in seen:
+            seen.add(para)
+            triples.append((para, refs))
+    facts = None
+    m = FACT.search("\n\n".join(paras))
+    if m:
+        try:
+            facts = {"vendorName": m.group(1).strip(), "invoiceNumber": m.group(2).strip(),
+                     "amountMinor": int((Decimal(m.group(4).replace(",", "")) * 100).to_integral_value()),
+                     "currency": m.group(3)}
+        except Exception:
+            facts = None
+    return triples, facts
+
+
+def reduce_pkg(p):
+    triples, facts = analyze(p)
+    r = {"packageId": p["packageId"], "coverSheetFacts": facts}
+    if triples:
+        r["candidateParagraphs"] = [{"index": i, "refs": refs, "text": t, "looksLikeDecoy": bool(DECOY.search(t))}
+                                    for i, (t, refs) in enumerate(triples)]
+    if not triples or facts is None:
+        r["package"] = p  # model needs the full text (to read facts or refs)
+    return r, triples, facts
 
 
 def refs_ok(refs, text):
@@ -141,19 +190,31 @@ def refs_ok(refs, text):
             and all(isinstance(r, str) and re.fullmatch(r"\[[^\[\]]+\]", r) and r in text for r in refs))
 
 
-def valid(d, text):
-    return (d.get("action") in ACTIONS and refs_ok(d.get("evidenceRefs"), text)
-            and isinstance(d.get("amountMinor"), int)
-            and isinstance(d.get("vendorName"), str) and d["vendorName"]
-            and isinstance(d.get("invoiceNumber"), str) and d["invoiceNumber"])
-
-
-def settle_confirmed(v, text):
-    """Python (not the AI) makes the final call: every check must be exactly True."""
-    c = v.get("checks") or {}
-    return (v.get("action") == "settle_invoice"
-            and all(c.get(k) is True for k in CHECKS)
-            and refs_ok(v.get("evidenceRefs"), text))
+def normalize(p, d, triples, facts):
+    """Turn a raw model answer into a trusted decision, or None."""
+    try:
+        if d.get("action") not in ACTIONS:
+            return None
+        if triples:
+            ci = d.get("controllingIndex")
+            if not isinstance(ci, int) or not (0 <= ci < len(triples)):
+                return None
+            refs = triples[ci][1]
+        else:
+            ci = None
+            refs = d.get("evidenceRefs")
+            if not refs_ok(refs, canon(p)):
+                return None
+        f = facts or {"vendorName": d.get("vendorName"), "invoiceNumber": d.get("invoiceNumber"),
+                      "amountMinor": d.get("amountMinor"), "currency": d.get("currency")}
+        if (not isinstance(f["vendorName"], str) or not f["vendorName"] or not isinstance(f["invoiceNumber"], str)
+                or not f["invoiceNumber"] or not isinstance(f["amountMinor"], int)):
+            return None
+        return {"action": d["action"], "ci": ci, "evidenceRefs": list(refs), "vendorName": f["vendorName"],
+                "invoiceNumber": f["invoiceNumber"], "amountMinor": f["amountMinor"],
+                "currency": str(f.get("currency") or "INR").upper(), "reason": str(d.get("reason", ""))[:600]}
+    except Exception:
+        return None
 
 
 def log_line(obj):
@@ -172,6 +233,8 @@ async def call_llm(system, user, timeout):
             json={"systemInstruction": {"parts": [{"text": system}]},
                   "contents": [{"role": "user", "parts": [{"text": user}]}],
                   "generationConfig": {"temperature": 0, "responseMimeType": "application/json"}})
+    if r.status_code != 200:
+        print("LLM HTTP", r.status_code, r.text[:300], flush=True)
     r.raise_for_status()
     text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.S)
@@ -179,22 +242,22 @@ async def call_llm(system, user, timeout):
     return json.loads(text[s:e + 1])
 
 
-async def ask_llm_safe(policy, pkgs, timeout):
+async def ask_llm_safe(policy, reduced, timeout):
     try:
-        res = await call_llm(PROMPT, f"Policy revision: {policy}\nPackages:\n{canon(pkgs)}", timeout)
+        res = await call_llm(PROMPT, f"Policy revision: {policy}\nPackages:\n{canon(reduced)}", timeout)
         return [d for d in res["decisions"] if isinstance(d, dict)]
     except Exception:
         traceback.print_exc()
         return []
 
 
-async def verify_settle(policy, p, sem, timeout):
-    async with sem:
-        try:
-            return await call_llm(VERIFY, f"Policy revision: {policy}\nPackage:\n{canon(p)}", timeout)
-        except Exception:
-            traceback.print_exc()
-            return None  # no answer => we will NOT settle
+async def verify_batch(policy, reduced, timeout):
+    try:
+        res = await call_llm(VERIFY, f"Policy revision: {policy}\nPackages:\n{canon(reduced)}", timeout)
+        return {v.get("packageId"): v for v in res["verdicts"] if isinstance(v, dict)}
+    except Exception:
+        traceback.print_exc()
+        return {}  # no answer => we will NOT settle
 
 
 def pkg_key(p):
@@ -202,19 +265,17 @@ def pkg_key(p):
     return sha(CACHE_VERSION + canon(body))
 
 
-def fallback_decision(text):
-    """Used only when the AI fails: never settle, and still give real references."""
-    refs = list(dict.fromkeys(re.findall(r"\[[^\[\]]+\]", text)))[:3]
-    while len(refs) < 3:
-        refs.append("[none-%d]" % len(refs))
-    return {"action": "open_exception", "vendorName": "unknown", "invoiceNumber": "unknown",
-            "amountMinor": 0, "currency": "INR", "evidenceRefs": refs,
-            "reason": "Automatic analysis was unavailable so this is escalated for manual review."}
+def fallback_decision(p, triples, facts):
+    """AI failed: never settle. Give real refs from the first candidate."""
+    refs = triples[0][1] if triples else (list(dict.fromkeys(REF.findall(canon(p))))[:3] + ["[none-0]", "[none-1]", "[none-2]"])[:3]
+    f = facts or {"vendorName": "unknown", "invoiceNumber": "unknown", "amountMinor": 0, "currency": "INR"}
+    return {"action": "open_exception", "ci": 0 if triples else None, "evidenceRefs": refs,
+            "reason": "Automatic analysis was unavailable so this is escalated for manual review.", **f}
 
 
 async def decide(policy, packages, deadline):
     left = lambda: deadline - time.monotonic()
-    out, todo, fresh = {}, [], {}
+    out, todo = {}, []
     for p in packages:
         with dblock:
             r = db.execute("SELECT body FROM cache WHERE h=?", (pkg_key(p),)).fetchone()
@@ -223,52 +284,54 @@ async def decide(policy, packages, deadline):
         else:
             todo.append(p)
     pending = list(todo)
+    info = {p["packageId"]: reduce_pkg(p) for p in pending}  # pid -> (reduced, triples, facts)
+    fresh = {}
 
-    # pass 1 (one retry for anything invalid, only if time allows)
+    # pass 1: one batched call on the SMALL reduced inputs (one retry if needed and time allows)
     for _ in range(2):
-        if not todo or left() < 12:
+        if not todo or left() < 10:
             break
-        got = {d.get("packageId"): d for d in await ask_llm_safe(policy, todo, max(5, min(25, left() - 8)))}
+        got = {d.get("packageId"): d for d in
+               await ask_llm_safe(policy, [info[p["packageId"]][0] for p in todo], max(5, min(26, left() - 8)))}
         still = []
         for p in todo:
-            d = got.get(p["packageId"])
-            if d and valid(d, canon(p)):
-                fresh[p["packageId"]] = d
+            _, triples, facts = info[p["packageId"]]
+            dec = normalize(p, got.get(p["packageId"], {}), triples, facts)
+            if dec:
+                fresh[p["packageId"]] = dec
             else:
                 still.append(p)
         todo = still
 
-    # pass 2: double-check every settle
-    by_id = {p["packageId"]: p for p in pending}
-    settles = [by_id[i] for i, d in fresh.items() if d["action"] == "settle_invoice"]
-    sem = asyncio.Semaphore(4)
-    vt = max(4, min(12, left() - 2))
-    verdicts = await asyncio.gather(*[verify_settle(policy, p, sem, vt) for p in settles])
-    verdict_of = {p["packageId"]: v for p, v in zip(settles, verdicts)}
+    # pass 2: skeptical review of every settle, in one batched call
+    settles = [p for p in pending if fresh.get(p["packageId"], {}).get("action") == "settle_invoice"]
+    verdicts = {}
+    if settles and left() > 5:
+        verdicts = await verify_batch(policy, [info[p["packageId"]][0] for p in settles], max(4, min(18, left() - 2)))
 
     for p in pending:
-        pid, text = p["packageId"], canon(p)
-        d = fresh.get(pid)
-        cacheable = True
+        pid = p["packageId"]
+        _, triples, facts = info[pid]
+        d, cacheable = fresh.get(pid), True
         if d is None:
-            d = fallback_decision(text)
-            cacheable = False
+            d, cacheable = fallback_decision(p, triples, facts), False
         elif d["action"] == "settle_invoice":
-            v = verdict_of.get(pid)
+            v = verdicts.get(pid)
+            checks = (v or {}).get("checks") or {}
+            ok = (v is not None and v.get("action") == "settle_invoice"
+                  and all(checks.get(k) is True for k in CHECKS)
+                  and (not triples or v.get("controllingIndex") == d["ci"]))
             if v is None:
-                d = {**d, "action": "open_exception"}
-                cacheable = False
-            elif settle_confirmed(v, text):
-                d = {**d, "reason": v.get("reason") or d.get("reason", "")}
-            elif v.get("action") in ACTIONS - {"settle_invoice"} and refs_ok(v.get("evidenceRefs"), text):
-                d = {**d, "action": v["action"], "evidenceRefs": v["evidenceRefs"], "reason": v.get("reason", "")}
-            else:
-                d = {**d, "action": "open_exception"}
+                d, cacheable = {**d, "action": "open_exception"}, False
+            elif not ok:
+                va = v.get("action")
+                d = {**d, "action": va if va in ACTIONS and va != "settle_invoice" else "open_exception",
+                     "reason": v.get("reason") or d["reason"]}
         out[pid] = d
-        log_line({"packageId": pid, "first": (fresh.get(pid) or {}).get("action"),
-                  "final": d["action"], "refs": d["evidenceRefs"], "verdict": verdict_of.get(pid)})
+        print("DECISION", pid, "cands=%d" % len(triples), "->", d["action"], d["evidenceRefs"], flush=True)
+        log_line({"packageId": pid, "candidates": len(triples), "final": d["action"], "refs": d["evidenceRefs"]})
         if d["action"] == "settle_invoice":
-            log_line({"SETTLED_PACKAGE": pid, "text": text})
+            log_line({"SETTLED_PACKAGE": pid, "text": canon(info[pid][0])})
         if cacheable:
             with dblock:
                 db.execute("INSERT OR REPLACE INTO cache VALUES(?,?)", (pkg_key(p), json.dumps(d)))
