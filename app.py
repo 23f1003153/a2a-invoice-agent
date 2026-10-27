@@ -1,6 +1,3 @@
-# Online Python compiler (interpreter)
-# Write and run Python online using this editor.
-
 import os, json, hashlib, sqlite3, threading, asyncio, uuid, re, datetime
 import httpx
 from fastapi import FastAPI, Request
@@ -70,66 +67,28 @@ def card():
     })
 
 # ---------- AI layer (separate from protocol code) ----------
+PROMPT = """You are an accounts-payable analyst. For EACH package choose exactly one action:
+settle_invoice, request_approval, hold_invoice, reject_duplicate, open_exception.
 
-PROMPT = """You are an accounts-payable analyst. Analyze EACH invoice package
-independently. Do not force every package into the same action.
+Decision rules, apply in this order:
+1. The SAME invoice (same vendor AND same invoice number) was already paid -> reject_duplicate.
+   A payment for a DIFFERENT invoice number is NOT a duplicate.
+2. Vendor, amount, PO or receipt records materially conflict -> open_exception.
+3. A named verification (bank details, tax ID, goods receipt, etc.) must finish before payment -> hold_invoice.
+4. Amount exceeds the autonomous approval limit that applies to this case -> request_approval.
+5. ONLY if none of the above apply -> settle_invoice.
 
-Choose exactly one action:
-settle_invoice, request_approval, hold_invoice, reject_duplicate,
-open_exception.
+How to read the documents:
+- Find the ONE paragraph that states the controlling facts of THIS case. Return its three bracketed references,
+  copied exactly, brackets included, all from that single paragraph.
+- Ignore the cover sheet, archive examples, training material and decoys.
+- Negated statements ("not a duplicate", "no hold required") mean that action does NOT apply.
+- When unsure between settle_invoice and anything else, do NOT choose settle_invoice.
 
-For each package, follow this procedure:
-
-1. Identify the single paragraph containing the controlling facts for THIS
-   invoice. Use the three exact bracketed evidence references from that
-   paragraph only. Do not combine references from different paragraphs.
-
-2. Distinguish controlling facts from cover sheets, archive examples,
-   training material, superseded rules, hypothetical cases and decoys.
-   Do not treat a negated condition as true. For example, "not a duplicate"
-   does not establish a duplicate.
-
-3. Extract the vendor, invoice number, amount in minor currency units,
-   and currency from the controlling facts. Do not copy these from an
-   unrelated invoice or an archive example.
-
-4. Evaluate each condition separately using the controlling evidence:
-   - Was this exact invoice already paid? A duplicate requires both the
-     same vendor and the same invoice number.
-   - Do the invoice, purchase order, receipt and other relevant records
-     materially conflict?
-   - Is a required verification still pending?
-   - What approval limit applies to this case, and does the amount exceed it?
-   - Are the records valid and reconciled?
-
-5. Select the action supported by the actual evidence and applicable policy:
-   - Exact invoice already paid: reject_duplicate.
-   - Material unresolved conflict: open_exception.
-   - Required verification pending: hold_invoice.
-   - Approval required because the applicable authority limit is exceeded:
-     request_approval.
-   - Settle only when the records are reconciled, no required verification
-     is pending, the invoice is not already paid, no material conflict
-     exists, and the applicable policy permits autonomous settlement.
-
-   Apply any explicit case-specific controlling policy when it changes
-   these rules. Do not invent an approval limit or policy exception.
-
-6. Explain the decisive facts and how the three selected references support
-   the chosen action. Do not choose an action merely because its name appears
-   in the documents.
-
-7. Process every package independently, including unfamiliar packages.
-   Do not use one package's facts to decide another package's action.
-   Do not artificially balance the action counts across the batch.
-   If the evidence is insufficient to resolve a material issue, do not settle.
-
-Return ONLY valid JSON in this format:
-{"decisions":[{"packageId":"","action":"","vendorName":"",
-"invoiceNumber":"","amountMinor":0,"currency":"",
-"evidenceRefs":["","",""],"reason":""}]}
-"""
-
+Also return vendorName, invoiceNumber, amountMinor (integer, smallest currency unit, e.g. 1234.50 -> 123450),
+currency, and "reason": one sentence on why the evidence supports the action.
+Reply ONLY JSON: {"decisions":[{"packageId":"","action":"","vendorName":"","invoiceNumber":"","amountMinor":0,
+"currency":"","evidenceRefs":["","",""],"reason":""}]}"""
 
 CHECKS = ["valid_and_reconciled", "within_authority", "no_pending_verification",
           "not_already_paid", "no_conflicting_records"]
